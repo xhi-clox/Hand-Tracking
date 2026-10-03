@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Laser Cradle</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060d;overflow:hidden;font-family:system-ui,sans-serif;color:#9fe}
+  #hud{position:fixed;left:16px;top:14px;font-size:13px;letter-spacing:.04em;text-shadow:0 0 8px #0ff;pointer-events:none;z-index:5}
+  #msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;background:#05060d;z-index:10;font-size:18px;line-height:1.5}
+  #msg button{margin-top:16px;padding:10px 22px;font-size:16px;color:#05060d;background:#0ff;border:0;border-radius:6px;cursor:pointer;box-shadow:0 0 18px #0ff}
+  #cam{display:none}
+  canvas{display:block}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="msg"><div>Laser Cradle<br><small>Show both hands to the camera. Touch fingertips together to make sparks.</small><br><button id="start">Start camera</button></div></div>
+<div id="hud">hands: 0 · beams: 0</div>
+<video id="cam" playsinline muted></video>
+
+<script>
+const TIPS = [4, 8, 12, 16, 20];
+const COLORS = [[0,255,255],[255,0,220],[255,240,40]]; // cyan, magenta, yellow
+const TOUCH_DIST = 38;      // px between fingertips to count as touching
+const MAX_PARTICLES = 600;
+
+let video, hands, latest = null, running = false;
+let particles = [];
+let prevDist = {};          // spring state per beam
+let touchCooldown = {};
+let hud = document.getElementById('hud');
+
+// ---------- helpers ----------
+function neonColor(t) {
+  t = constrain(t, 0, 1) * 2;
+  const a = COLORS[t < 1 ? 0 : 1], b = COLORS[t < 1 ? 1 : 2], f = t % 1 || (t >= 2 ? 1 : 0);
+  return [a[0] + (b[0]-a[0])*f, a[1] + (b[1]-a[1])*f, a[2] + (b[2]-a[2])*f];
+}
+
+let sprites = [];
+function makeSprites() {
+  for (let i = 0; i < 12; i++) {
+    const c = neonColor(i / 11), cv = document.createElement('canvas');
+    cv.width = cv.height = 32;
+    const g = cv.getContext('2d'), gr = g.createRadialGradient(16,16,0,16,16,16);
+    gr.addColorStop(0, 'rgba(255,255,255,1)');
+    gr.addColorStop(0.25, `rgba(${c[0]|0},${c[1]|0},${c[2]|0},0.9)`);
+    gr.addColorStop(1, `rgba(${c[0]|0},${c[1]|0},${c[2]|0},0)`);
+    g.fillStyle = gr; g.fillRect(0, 0, 32, 32);
+    sprites.push(cv);
+  }
+}
+
+class Particle {
+  constructor(x, y) {
+    const a = random(TWO_PI), s = random(2, 11);
+    this.x = x; this.y = y;
+    this.vx = cos(a)*s; this.vy = sin(a)*s;
+    this.life = 1; this.decay = random(0.014, 0.035);
+    this.sp = floor(random(12)); this.size = random(1.5, 4.5);
+  }
+  update() {
+    this.x += this.vx; this.y += this.vy;
+    this.vx *= 0.95; this.vy = this.vy*0.95 + 0.08;
+    this.life -= this.decay;
+  }
+  draw(ctx) {
+    const a = max(this.life, 0), r = this.size * (1 + a) * 2.2;
+    ctx.globalAlpha = a;
+    ctx.drawImage(sprites[this.sp], this.x - r, this.y - r, r * 2, r * 2);
+  }
+}
+
+function burst(x, y) {
+  const room = MAX_PARTICLES - particles.length;
+  const n = min(70, room);
+  for (let i = 0; i < n; i++) particles.push(new Particle(x, y));
+  // white-hot flash
+  flashes.push({x, y, life: 1});
+}
+let flashes = [];
+
+// ---------- MediaPipe ----------
+function setupHands() {
+  hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+  hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+  hands.onResults(r => { latest = r; });
+}
+
+async function startCamera() {
+  const msg = document.getElementById('msg');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: 'user' }, audio: false });
+    video = document.getElementById('cam');
+    video.srcObject = stream;
+    await video.play();
+    setupHands();
+    running = true;
+    msg.style.display = 'none';
+    loopDetect();
+  } catch (e) {
+    msg.innerHTML = '<div>Camera unavailable.<br><small>' + e.message + '<br>Allow camera access (use https or localhost) and reload.</small></div>';
+  }
+}
+
+let busy = false;
+async function loopDetect() {
+  if (!running) return;
+  if (!busy && video.readyState >= 2) {
+    busy = true;
+    try {
+      await Promise.race([hands.send({ image: video }), new Promise(r => setTimeout(r, 1500))]);
+    } catch (e) { console.error(e); }
+    busy = false;
+  }
+  requestAnimationFrame(loopDetect);
+}
+
+document.getElementById('start').onclick = startCamera;
+
+// ---------- p5 ----------
+function setup() {
+  const c = createCanvas(windowWidth, windowHeight);
+  pixelDensity(1);
+  frameRate(60);
+  makeSprites();
+  c.elt.getContext('2d');
+}
+function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
+// map normalized landmark to mirrored screen coords, cover-fit the video
+function toScreen(lm) {
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  const s = max(width / vw, height / vh);
+  const ox = (width - vw*s) / 2, oy = (height - vh*s) / 2;
+  return { x: width - (ox + lm.x*vw*s), y: oy + lm.y*vh*s };
+}
+
+function drawVideo(ctx) {
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  const s = max(width / vw, height / vh);
+  ctx.save();
+  ctx.translate(width, 0); ctx.scale(-1, 1);       // mirror
+  ctx.drawImage(video, (width - vw*s)/2, (height - vh*s)/2, vw*s, vh*s);
+  ctx.restore();
+  ctx.fillStyle = 'rgba(3,4,14,0.62)';              // darken for neon contrast
+  ctx.fillRect(0, 0, width, height);
+}
+
+function beam(ctx, p, q, key, t) {
+  const d = dist(p.x, p.y, q.x, q.y);
+  const spread = constrain(d / (width * 0.7), 0, 1);
+  // elastic: spring-damped stretch drives a wobble that decays
+  const st = prevDist[key] || { d, v: 0, w: 0 };
+  st.v += (d - st.d) * 0.08;  st.v *= 0.86;  st.w = st.w*0.9 + st.v;
+  st.d = d; prevDist[key] = st;
+  const wob = constrain(st.w, -30, 30);
+
+  const mx = (p.x + q.x)/2, my = (p.y + q.y)/2;
+  const nx = -(q.y - p.y)/(d||1), ny = (q.x - p.x)/(d||1);
+  const sag = wob * 0.6 + sin(t*0.01 + key.length) * 3 * (1 - spread);
+  const cx = mx + nx*sag, cy = my + ny*sag;
+
+  const g = ctx.createLinearGradient(p.x, p.y, q.x, q.y);
+  g.addColorStop(0, `rgb(${COLORS[0]})`);
+  g.addColorStop(0.5, `rgb(${COLORS[1]})`);
+  g.addColorStop(1, `rgb(${COLORS[2]})`);
+
+  const core = 1 + (1 - spread) * 1.6;               // thicker when close, thinner when stretched
+  ctx.lineCap = 'round';
+  const path = () => { ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.quadraticCurveTo(cx, cy, q.x, q.y); };
+
+  // outer bloom
+  ctx.shadowColor = `rgb(${neonColor(spread)})`; ctx.shadowBlur = 18;
+  ctx.strokeStyle = g; ctx.globalAlpha = 0.45; ctx.lineWidth = core*4; path(); ctx.stroke();
+  // mid beam
+  ctx.shadowBlur = 8; ctx.globalAlpha = 0.9; ctx.lineWidth = core*1.8; path(); ctx.stroke();
+  // hot white core, flickers slightly like a laser
+  ctx.shadowBlur = 6; ctx.shadowColor = '#fff';
+  ctx.strokeStyle = `rgba(255,255,255,${0.8 + 0.2*sin(t*0.05 + d)})`; ctx.globalAlpha = 1;
+  ctx.lineWidth = max(1, core*0.6); path(); ctx.stroke();
+
+  // endpoint glints
+  ctx.shadowBlur = 16; ctx.fillStyle = '#fff';
+  for (const e of [p, q]) { ctx.beginPath(); ctx.arc(e.x, e.y, 2.5 + (1-spread)*2, 0, TWO_PI); ctx.fill(); }
+}
+
+function drawLandmarks(ctx, pts, col) {
+  ctx.shadowColor = col; ctx.shadowBlur = 8;
+  for (let i = 0; i < pts.length; i++) {
+    const tip = TIPS.includes(i);
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(pts[i].x, pts[i].y, tip ? 6 : 3.5, 0, TWO_PI); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(pts[i].x, pts[i].y, tip ? 2.2 : 1.2, 0, TWO_PI); ctx.fill();
+  }
+}
+
+function draw() {
+  try { render(); }
+  catch (e) {
+    console.error(e);
+    const c = drawingContext;
+    c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1; c.shadowBlur = 0;
+  }
+}
+
+function render() {
+  const ctx = drawingContext;
+  const t = millis();
+  ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+
+  if (!running) { background(5, 6, 13); return; }
+  drawVideo(ctx);
+
+  let nHands = 0, nBeams = 0;
+  if (latest && latest.multiHandLandmarks && latest.multiHandLandmarks.length) {
+    // handedness is mirrored in selfie view; sort by screen x so left/right is stable
+    const all = latest.multiHandLandmarks.map(h => h.map(toScreen));
+    nHands = all.length;
+    all.sort((a, b) => a[0].x - b[0].x);
+    const L = all[0], R = all.length > 1 ? all[1] : null;
+
+    ctx.globalCompositeOperation = 'lighter';
+    drawLandmarks(ctx, L, '#0ff');
+    if (R) drawLandmarks(ctx, R, '#f0f');
+
+    if (R) {
+      // each fingertip connects to its counterpart and its neighbors → woven cradle
+      for (let i = 0; i < TIPS.length; i++) {
+        for (let j = max(0, i-1); j <= min(TIPS.length-1, i+1); j++) {
+          const p = L[TIPS[i]], q = R[TIPS[j]];
+          beam(ctx, p, q, i + '-' + j, t); nBeams++;
+        }
+      }
+      // touch detection: any tip of L near any tip of R
+      for (const a of TIPS) for (const b of TIPS) {
+        const p = L[a], q = R[b];
+        if (dist(p.x, p.y, q.x, q.y) < TOUCH_DIST) {
+          const k = a + '_' + b;
+          if (!touchCooldown[k] || t - touchCooldown[k] > 350) {
+            touchCooldown[k] = t;
+            burst((p.x + q.x)/2, (p.y + q.y)/2);
+          }
+        }
+      }
+    }
+  }
+
+  // particles + flashes
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.shadowBlur = 0;
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i]; p.update();
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.draw(ctx);
+  }
+  ctx.globalAlpha = 1;
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    const f = flashes[i]; f.life -= 0.08;
+    if (f.life <= 0) { flashes.splice(i, 1); continue; }
+    const r = 90 * (1 - f.life) + 12;
+    const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, r);
+    g.addColorStop(0, `rgba(255,255,255,${f.life})`);
+    g.addColorStop(0.4, `rgba(0,255,255,${f.life*0.5})`);
+    g.addColorStop(1, 'rgba(255,0,220,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(f.x, f.y, r, 0, TWO_PI); ctx.fill();
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+  if (frameCount % 15 === 0) hud.textContent = `hands: ${nHands} · beams: ${nBeams} · sparks: ${particles.length}`;
+}
+</script>
+</body>
+</html>
